@@ -1,7 +1,7 @@
-import math
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date
 from typing import Dict, List, Optional, Tuple
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -184,18 +184,79 @@ def kelly_fraction(w: float, r: float) -> float:
     return max(0.0, (w * (r + 1) - 1) / r)
 
 
+WATCHLIST_FILE = Path("watchlist.json")
+
+
+def load_watchlist(sb):
+    if sb:
+        try:
+            r = sb.table("watchlist").select("ticker,asset_class,risk_tier").execute()
+            return r.data or []
+        except Exception as e:
+            st.warning(f"Supabase watchlist load failed: {e}")
+    if WATCHLIST_FILE.exists():
+        try:
+            return json.loads(WATCHLIST_FILE.read_text())
+        except Exception as e:
+            st.warning(f"Local watchlist read failed: {e}")
+    return []
+
+
+def save_watchlist(sb, watchlist):
+    if sb:
+        try:
+            sb.table("watchlist").delete().neq("ticker", "").execute()
+            if watchlist:
+                sb.table("watchlist").insert(watchlist).execute()
+            return
+        except Exception as e:
+            st.warning(f"Supabase watchlist save failed: {e}")
+    try:
+        WATCHLIST_FILE.write_text(json.dumps(watchlist))
+    except Exception as e:
+        st.warning(f"Local watchlist save failed: {e}")
+
+
+@st.cache_data(ttl=3600)
+def search_tickers(query: str) -> List[dict]:
+    if not query.strip():
+        return []
+    try:
+        url = "https://query2.finance.yahoo.com/v1/finance/search"
+        r = requests.get(url, params={"q": query, "quotesCount": 10, "newsCount": 0}, timeout=15)
+        r.raise_for_status()
+        quotes = r.json().get("quotes", [])
+        return [{"symbol": q.get("symbol"), "name": q.get("shortname") or q.get("longname") or "", "exchange": q.get("exchange", "")} for q in quotes if q.get("symbol")]
+    except Exception as e:
+        st.warning(f"Ticker search unavailable: {e}")
+        return []
+
 st.title("2026 Wealth Accumulation & Risk Management Dashboard")
 
+sb = get_supabase()
 if "watchlist" not in st.session_state:
-    st.session_state.watchlist = []
+    st.session_state.watchlist = load_watchlist(sb)
 
 with st.sidebar:
     st.header("Watchlist Manager")
-    t = st.text_input("Ticker")
+    search_q = st.text_input("Find ticker", placeholder="e.g. Bank Central Asia, Tesla, Ethereum")
+    candidates = search_tickers(search_q)
+    selected_symbol = ""
+    if candidates:
+        labels = [f"{c['symbol']} | {c['name']} ({c['exchange']})" for c in candidates]
+        picked = st.selectbox("Search results", labels, index=0)
+        selected_symbol = picked.split(" | ")[0]
+    t = st.text_input("Ticker", value=selected_symbol)
     ac = st.selectbox("Asset Class", ASSET_CLASSES)
     rt = st.selectbox("Risk Tier", RISK_TIERS)
     if st.button("Add Asset") and t:
-        st.session_state.watchlist.append({"ticker": normalize_ticker(t, ac), "asset_class": ac, "risk_tier": rt})
+        item = {"ticker": normalize_ticker(t, ac), "asset_class": ac, "risk_tier": rt}
+        if item not in st.session_state.watchlist:
+            st.session_state.watchlist.append(item)
+            save_watchlist(sb, st.session_state.watchlist)
+    if st.button("Clear Watchlist"):
+        st.session_state.watchlist = []
+        save_watchlist(sb, st.session_state.watchlist)
     if st.session_state.watchlist:
         st.dataframe(pd.DataFrame(st.session_state.watchlist), use_container_width=True)
 
@@ -374,7 +435,6 @@ with tabs[4]:
 
 with tabs[5]:
     st.subheader("Behavioral Guardrail Journal")
-    sb = get_supabase()
     cols = st.columns(3)
     jt = cols[0].text_input("Ticker", "SPY")
     jac = cols[1].selectbox("Asset Class", ASSET_CLASSES, key="j_ac")
